@@ -1,0 +1,15 @@
+# Ambientes virtuais e caches Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Artefatos de build do PyInstaller
+build/
+dist/
+
+# Arquivos temporários
+*.tmp
+.trim_tmp_*
