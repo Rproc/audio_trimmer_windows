@@ -18,6 +18,7 @@ from audio_engine import (
     trim_audio_lossless,
 )
 from main import AudioTrimmerWindow
+from themes import THEME_CLASSIC, THEME_MODERN
 
 
 def _run_ffmpeg(*args: str) -> None:
@@ -128,6 +129,77 @@ class TestAudioTrimmer(unittest.TestCase):
             self.assertAlmostEqual(win._start_sec, 1.0, places=3)
             self.assertAlmostEqual(win._end_sec, info.duration - 1.0, places=3)
             win.close()
+
+    def test_theme_menu_switching_preserves_state(self) -> None:
+        import numpy as np
+        from PySide6.QtCore import QSettings
+        from audio_engine import AudioInfo
+
+        settings = QSettings(AudioTrimmerWindow.SETTINGS_ORG, AudioTrimmerWindow.SETTINGS_APP)
+        prev_theme = settings.value(AudioTrimmerWindow.SETTINGS_THEME_KEY, None)
+
+        win = AudioTrimmerWindow(initial_theme=THEME_MODERN)
+        try:
+            self.assertEqual(win.current_theme_id, THEME_MODERN)
+            self.assertTrue(win._theme_actions[THEME_MODERN].isChecked())
+            self.assertFalse(win._theme_actions[THEME_CLASSIC].isChecked())
+            self.assertTrue(win.statusBar().isHidden())
+            self.assertFalse(win.waveform._palette.classic_style)
+
+            # Simula áudio carregado sem depender de ffmpeg
+            fake_info = AudioInfo(
+                path=Path("fake_song.mp3"),
+                duration=12.0,
+                codec_name="mp3",
+                sample_rate=44100,
+                channels=2,
+                bit_rate=320000,
+                format_name="mp3",
+                has_cover_art=False,
+                tags={"artist": "Artista", "title": "Música"},
+            )
+            fake_peaks = np.zeros((400, 2), dtype=np.float32)
+            win._on_audio_loaded(fake_info, fake_peaks)
+            win._nudge_start(2.0)
+            win._nudge_end(-3.0)
+            win.waveform.set_zoom(4.0)
+            win.slider_vol.setValue(60)
+            win.chk_loop.setChecked(True)
+            win.edit_output.setText("custom_out.mp3")
+
+            # Alterna para Clássico via ação do menu Tema
+            win._theme_actions[THEME_CLASSIC].trigger()
+            self.assertEqual(win.current_theme_id, THEME_CLASSIC)
+            self.assertTrue(win._theme_actions[THEME_CLASSIC].isChecked())
+            self.assertFalse(win.statusBar().isHidden())
+            self.assertTrue(win.waveform._palette.classic_style)
+            self.assertIsNotNone(win.btn_jump_in)
+            self.assertIsNotNone(win.lbl_status_time)
+            self.assertAlmostEqual(win._start_sec, 2.0, places=3)
+            self.assertAlmostEqual(win._end_sec, 9.0, places=3)
+            self.assertAlmostEqual(win.waveform.zoom_factor(), 4.0, places=2)
+            self.assertEqual(win.slider_vol.value(), 60)
+            self.assertTrue(win.chk_loop.isChecked())
+            self.assertTrue(win.act_loop.isChecked())
+            self.assertEqual(win.edit_output.text(), "custom_out.mp3")
+
+            # Alterna de volta para Moderno via ação do menu Tema
+            win._theme_actions[THEME_MODERN].trigger()
+            self.assertEqual(win.current_theme_id, THEME_MODERN)
+            self.assertTrue(win.statusBar().isHidden())
+            self.assertFalse(win.waveform._palette.classic_style)
+            self.assertIsNone(win.btn_jump_in)
+            self.assertAlmostEqual(win._start_sec, 2.0, places=3)
+            self.assertAlmostEqual(win._end_sec, 9.0, places=3)
+            self.assertEqual(win.slider_vol.value(), 60)
+            self.assertTrue(win.chk_loop.isChecked())
+            self.assertEqual(win.edit_output.text(), "custom_out.mp3")
+        finally:
+            win.close()
+            if prev_theme is None:
+                settings.remove(AudioTrimmerWindow.SETTINGS_THEME_KEY)
+            else:
+                settings.setValue(AudioTrimmerWindow.SETTINGS_THEME_KEY, prev_theme)
 
 
 if __name__ == "__main__":

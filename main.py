@@ -5,14 +5,24 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QKeySequence,
+    QShortcut,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -35,114 +45,16 @@ from audio_engine import (
     probe_audio,
     trim_audio_lossless,
 )
+from themes import (
+    DARK_STYLESHEET,
+    THEME_CLASSIC,
+    THEME_MODERN,
+    THEMES,
+    build_qt_palette,
+    get_theme,
+    make_classic_icon,
+)
 from waveform_widget import WaveformWidget
-
-
-DARK_STYLESHEET = """
-QMainWindow, QWidget {
-    background-color: #0b1120;
-    color: #e2e8f0;
-    font-family: "Segoe UI", sans-serif;
-    font-size: 13px;
-}
-QFrame#Card {
-    background-color: #111827;
-    border: 1px solid #1e293b;
-    border-radius: 10px;
-}
-QLabel#TitleLabel {
-    font-size: 16px;
-    font-weight: 600;
-    color: #f8fafc;
-}
-QLabel#MetaLabel {
-    color: #94a3b8;
-    font-size: 12px;
-}
-QLabel#BadgeLossless {
-    background-color: rgba(34, 197, 94, 0.16);
-    color: #4ade80;
-    border: 1px solid rgba(34, 197, 94, 0.4);
-    border-radius: 6px;
-    padding: 4px 10px;
-    font-weight: 600;
-    font-size: 12px;
-}
-QLineEdit {
-    background-color: #0f172a;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    padding: 6px 10px;
-    color: #f8fafc;
-    font-family: "Consolas", monospace;
-    font-size: 13px;
-}
-QLineEdit:focus {
-    border-color: #38bdf8;
-}
-QPushButton {
-    background-color: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    padding: 7px 14px;
-    color: #f1f5f9;
-    font-weight: 500;
-}
-QPushButton:hover {
-    background-color: #273549;
-    border-color: #475569;
-}
-QPushButton:pressed {
-    background-color: #0f172a;
-}
-QPushButton:disabled {
-    color: #64748b;
-    background-color: #111827;
-    border-color: #1e293b;
-}
-QPushButton#PrimaryButton {
-    background-color: #0284c7;
-    border: 1px solid #0ea5e9;
-    color: #ffffff;
-    font-weight: 600;
-    padding: 9px 18px;
-}
-QPushButton#PrimaryButton:hover {
-    background-color: #0ea5e9;
-}
-QPushButton#PrimaryButton:disabled {
-    background-color: #1e293b;
-    border-color: #334155;
-    color: #64748b;
-}
-QPushButton#NudgeButton {
-    padding: 5px 8px;
-    font-size: 12px;
-    min-width: 42px;
-}
-QSlider::groove:horizontal {
-    height: 6px;
-    background: #1e293b;
-    border-radius: 3px;
-}
-QSlider::handle:horizontal {
-    background: #38bdf8;
-    width: 14px;
-    margin: -4px 0;
-    border-radius: 7px;
-}
-QProgressBar {
-    background-color: #0f172a;
-    border: 1px solid #1e293b;
-    border-radius: 4px;
-    height: 8px;
-    text-align: center;
-}
-QProgressBar::chunk {
-    background-color: #38bdf8;
-    border-radius: 3px;
-}
-"""
 
 
 class LoadAudioWorker(QThread):
@@ -196,39 +108,226 @@ class TrimWorker(QThread):
 
 
 class AudioTrimmerWindow(QMainWindow):
-    def __init__(self, initial_file: Path | None = None) -> None:
+    SETTINGS_ORG = "AudioTrimmer"
+    SETTINGS_APP = "AudioTrimmer"
+    SETTINGS_THEME_KEY = "ui/theme"
+
+    def __init__(
+        self,
+        initial_file: Path | None = None,
+        initial_theme: str | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("Cortador de Áudio Sem Perda (Qt + FFmpeg)")
-        self.resize(980, 620)
+        self.resize(980, 640)
         self.setAcceptDrops(True)
 
         self._audio_info: AudioInfo | None = None
+        self._peaks = None
         self._start_sec: float = 0.0
         self._end_sec: float = 0.0
+        self._playhead_sec: float = 0.0
         self._play_selection_only: bool = False
+        self._loop_enabled: bool = False
+        self._volume_pct: int = 85
+        self._output_text: str = ""
+        self._status_text: str = "Pronto."
+        self._is_busy: bool = False
+        self._open_folder_visible: bool = False
+
         self._load_worker: LoadAudioWorker | None = None
         self._trim_worker: TrimWorker | None = None
         self._last_output_path: Path | None = None
 
+        self._statusbar_widgets: list[QWidget] = []
+        self._theme_actions: dict[str, QAction] = {}
+        self.btn_jump_in: QPushButton | None = None
+        self.btn_jump_out: QPushButton | None = None
+        self.lbl_vol_pct: QLabel | None = None
+        self.lbl_status_time: QLabel | None = None
+
         self._player = QMediaPlayer(self)
         self._audio_output = QAudioOutput(self)
-        self._audio_output.setVolume(0.85)
+        self._audio_output.setVolume(self._volume_pct / 100.0)
         self._player.setAudioOutput(self._audio_output)
         self._player.positionChanged.connect(self._on_player_position_changed)
         self._player.playbackStateChanged.connect(self._on_playback_state_changed)
 
-        self._build_ui()
+        self._current_theme_id: str = self._resolve_initial_theme(initial_theme)
+
+        self._build_menu_bar()
         self._setup_shortcuts()
-        self._update_controls_enabled(False)
+        self.set_theme(self._current_theme_id, persist=False)
 
         if initial_file and initial_file.exists():
             self.load_file(initial_file)
 
-    def _build_ui(self) -> None:
+    @property
+    def current_theme_id(self) -> str:
+        return self._current_theme_id
+
+    def _resolve_initial_theme(self, initial_theme: str | None) -> str:
+        if initial_theme in THEMES:
+            return initial_theme
+        settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
+        saved = str(settings.value(self.SETTINGS_THEME_KEY, THEME_MODERN))
+        return saved if saved in THEMES else THEME_MODERN
+
+    # --- Menu Bar (inclui menu de Tema, sem switch) ---
+    def _build_menu_bar(self) -> None:
+        menu_bar = self.menuBar()
+
+        # Arquivo
+        file_menu = menu_bar.addMenu("&Arquivo")
+        self.act_open = QAction("Abrir Áudio...", self)
+        self.act_open.setShortcut(QKeySequence("Ctrl+O"))
+        self.act_open.triggered.connect(self._on_open_clicked)
+        file_menu.addAction(self.act_open)
+
+        self.act_export = QAction("Cortar e Salvar (Sem Perda)...", self)
+        self.act_export.setShortcut(QKeySequence("Ctrl+S"))
+        self.act_export.triggered.connect(self._on_export_clicked)
+        file_menu.addAction(self.act_export)
+
+        self.act_open_folder = QAction("Abrir Pasta de Saída", self)
+        self.act_open_folder.triggered.connect(self._open_output_folder)
+        file_menu.addAction(self.act_open_folder)
+
+        file_menu.addSeparator()
+        self.act_exit = QAction("Sair", self)
+        self.act_exit.setShortcut(QKeySequence("Alt+F4"))
+        self.act_exit.triggered.connect(self.close)
+        file_menu.addAction(self.act_exit)
+
+        # Reprodução
+        play_menu = menu_bar.addMenu("&Reprodução")
+        self.act_play = QAction("Tocar / Pausar\tEspaço", self)
+        self.act_play.triggered.connect(self._toggle_play)
+        play_menu.addAction(self.act_play)
+
+        self.act_play_sel = QAction("Tocar Seleção", self)
+        self.act_play_sel.triggered.connect(self._play_selection)
+        play_menu.addAction(self.act_play_sel)
+
+        self.act_stop = QAction("Parar", self)
+        self.act_stop.triggered.connect(self._stop_playback)
+        play_menu.addAction(self.act_stop)
+
+        play_menu.addSeparator()
+        self.act_loop = QAction("Repetir Seleção (Loop)", self)
+        self.act_loop.setCheckable(True)
+        self.act_loop.toggled.connect(self._set_loop_enabled)
+        play_menu.addAction(self.act_loop)
+
+        play_menu.addSeparator()
+        self.act_jump_in = QAction("Ir para IN\t[", self)
+        self.act_jump_in.triggered.connect(lambda: self._seek_to(self._start_sec))
+        play_menu.addAction(self.act_jump_in)
+
+        self.act_jump_out = QAction("Ir para OUT\t]", self)
+        self.act_jump_out.triggered.connect(lambda: self._seek_to(self._end_sec))
+        play_menu.addAction(self.act_jump_out)
+
+        # Corte
+        cut_menu = menu_bar.addMenu("&Corte")
+        self.act_mark_in = QAction("Marcar IN no Cursor\tI", self)
+        self.act_mark_in.triggered.connect(self._mark_in_at_playhead)
+        cut_menu.addAction(self.act_mark_in)
+
+        self.act_mark_out = QAction("Marcar OUT no Cursor\tO", self)
+        self.act_mark_out.triggered.connect(self._mark_out_at_playhead)
+        cut_menu.addAction(self.act_mark_out)
+
+        self.act_reset_range = QAction("Selecionar Tudo", self)
+        self.act_reset_range.triggered.connect(self._reset_range)
+        cut_menu.addAction(self.act_reset_range)
+
+        cut_menu.addSeparator()
+        self.act_zoom_in = QAction("Aumentar Zoom (+)", self)
+        self.act_zoom_in.triggered.connect(self._zoom_in)
+        cut_menu.addAction(self.act_zoom_in)
+
+        self.act_zoom_out = QAction("Diminuir Zoom (-)", self)
+        self.act_zoom_out.triggered.connect(self._zoom_out)
+        cut_menu.addAction(self.act_zoom_out)
+
+        self.act_zoom_reset = QAction("Resetar Zoom (1.0x)", self)
+        self.act_zoom_reset.triggered.connect(self._zoom_reset)
+        cut_menu.addAction(self.act_zoom_reset)
+
+        # Tema (menu exclusivo de seleção)
+        theme_menu = menu_bar.addMenu("&Tema")
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+        for theme_id, spec in THEMES.items():
+            act = QAction(spec.name, self)
+            act.setCheckable(True)
+            act.setStatusTip(spec.description)
+            act.setToolTip(spec.description)
+            act.triggered.connect(lambda checked, tid=theme_id: checked and self.set_theme(tid))
+            theme_group.addAction(act)
+            theme_menu.addAction(act)
+            self._theme_actions[theme_id] = act
+
+    # --- Alternância de temas ---
+    def set_theme(self, theme_id: str, persist: bool = True) -> None:
+        spec = get_theme(theme_id)
+        if self.centralWidget() is not None and spec.id == self._current_theme_id:
+            return
+        zoom = 1.0
+        view_start = 0.0
+        if hasattr(self, "waveform") and self.waveform is not None:
+            zoom, view_start = self.waveform.view_state()
+        if hasattr(self, "edit_output") and self.edit_output is not None:
+            self._output_text = self.edit_output.text()
+
+        self._current_theme_id = spec.id
+        for tid, act in self._theme_actions.items():
+            act.blockSignals(True)
+            act.setChecked(tid == spec.id)
+            act.blockSignals(False)
+
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            app.setPalette(build_qt_palette(spec.id))
+            app.setStyleSheet(spec.stylesheet)
+        else:
+            self.setPalette(build_qt_palette(spec.id))
+            self.setStyleSheet(spec.stylesheet)
+
+        self._clear_status_bar()
+        self.btn_jump_in = None
+        self.btn_jump_out = None
+        self.lbl_vol_pct = None
+        self.lbl_status_time = None
+
+        if spec.id == THEME_CLASSIC:
+            self._build_classic_ui(spec.waveform_palette)
+        else:
+            self._build_modern_ui(spec.waveform_palette)
+
+        self._restore_ui_state(zoom=zoom, view_start=view_start)
+
+        if persist:
+            settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
+            settings.setValue(self.SETTINGS_THEME_KEY, spec.id)
+
+    def _clear_status_bar(self) -> None:
+        sb = self.statusBar()
+        for w in self._statusbar_widgets:
+            sb.removeWidget(w)
+            w.deleteLater()
+        self._statusbar_widgets.clear()
+        sb.clearMessage()
+
+    # --- UI 1: Visual Atual (Moderno Escuro) ---
+    def _build_modern_ui(self, wave_palette) -> None:
+        self.statusBar().setVisible(False)
+
         root = QWidget(self)
         self.setCentralWidget(root)
         main_layout = QVBoxLayout(root)
-        main_layout.setContentsMargins(16, 16, 16, 14)
+        main_layout.setContentsMargins(16, 14, 16, 14)
         main_layout.setSpacing(12)
 
         # --- Cabeçalho ---
@@ -264,7 +363,7 @@ class AudioTrimmerWindow(QMainWindow):
         wave_layout.setContentsMargins(12, 12, 12, 10)
         wave_layout.setSpacing(8)
 
-        self.waveform = WaveformWidget()
+        self.waveform = WaveformWidget(palette=wave_palette)
         self.waveform.rangeChanged.connect(self._on_waveform_range_changed)
         self.waveform.seekRequested.connect(self._on_waveform_seek)
         self.waveform.zoomChanged.connect(self._on_zoom_changed)
@@ -285,9 +384,10 @@ class AudioTrimmerWindow(QMainWindow):
 
         self.chk_loop = QCheckBox("Loop")
         self.chk_loop.setToolTip("Repetir trecho selecionado continuamente")
+        self.chk_loop.toggled.connect(self._set_loop_enabled)
 
         self.lbl_playhead = QLabel("00:00.000")
-        self.lbl_playhead.setStyleSheet("font-family: Consolas; color: #f8fafc; font-weight: 600;")
+        self.lbl_playhead.setObjectName("PlayheadLabel")
 
         transport.addWidget(self.btn_play)
         transport.addWidget(self.btn_play_sel)
@@ -301,18 +401,18 @@ class AudioTrimmerWindow(QMainWindow):
         # Zoom
         self.btn_zoom_out = QPushButton("-")
         self.btn_zoom_out.setObjectName("NudgeButton")
-        self.btn_zoom_out.clicked.connect(lambda: self.waveform.set_zoom(self.waveform.zoom_factor() * 0.7))
+        self.btn_zoom_out.clicked.connect(self._zoom_out)
 
         self.lbl_zoom = QLabel("1.0x")
-        self.lbl_zoom.setStyleSheet("color: #94a3b8; min-width: 40px;")
+        self.lbl_zoom.setObjectName("ZoomLabel")
         self.lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.btn_zoom_in = QPushButton("+")
         self.btn_zoom_in.setObjectName("NudgeButton")
-        self.btn_zoom_in.clicked.connect(lambda: self.waveform.set_zoom(self.waveform.zoom_factor() * 1.4))
+        self.btn_zoom_in.clicked.connect(self._zoom_in)
 
         self.btn_zoom_reset = QPushButton("Reset Zoom")
-        self.btn_zoom_reset.clicked.connect(self.waveform.reset_zoom)
+        self.btn_zoom_reset.clicked.connect(self._zoom_reset)
 
         transport.addWidget(QLabel("Zoom:"))
         transport.addWidget(self.btn_zoom_out)
@@ -325,9 +425,9 @@ class AudioTrimmerWindow(QMainWindow):
         transport.addWidget(QLabel("Vol:"))
         self.slider_vol = QSlider(Qt.Orientation.Horizontal)
         self.slider_vol.setRange(0, 100)
-        self.slider_vol.setValue(85)
+        self.slider_vol.setValue(self._volume_pct)
         self.slider_vol.setFixedWidth(90)
-        self.slider_vol.valueChanged.connect(lambda v: self._audio_output.setVolume(v / 100.0))
+        self.slider_vol.valueChanged.connect(self._on_volume_changed)
         transport.addWidget(self.slider_vol)
 
         wave_layout.addLayout(transport)
@@ -344,7 +444,7 @@ class AudioTrimmerWindow(QMainWindow):
         in_box = QVBoxLayout()
         in_top = QHBoxLayout()
         lbl_in = QLabel("Início (IN)")
-        lbl_in.setStyleSheet("color: #4ade80; font-weight: 600;")
+        lbl_in.setObjectName("InLabel")
         self.btn_mark_in = QPushButton("Marcar aqui (I)")
         self.btn_mark_in.clicked.connect(self._mark_in_at_playhead)
         in_top.addWidget(lbl_in)
@@ -379,7 +479,7 @@ class AudioTrimmerWindow(QMainWindow):
         out_box = QVBoxLayout()
         out_top = QHBoxLayout()
         lbl_out = QLabel("Fim (OUT)")
-        lbl_out.setStyleSheet("color: #fbbf24; font-weight: 600;")
+        lbl_out.setObjectName("OutLabel")
         self.btn_mark_out = QPushButton("Marcar aqui (O)")
         self.btn_mark_out.clicked.connect(self._mark_out_at_playhead)
         out_top.addWidget(lbl_out)
@@ -417,9 +517,7 @@ class AudioTrimmerWindow(QMainWindow):
         lbl_dur_title.setObjectName("MetaLabel")
         lbl_dur_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_cut_duration = QLabel("00:00.000")
-        self.lbl_cut_duration.setStyleSheet(
-            "font-family: Consolas; font-size: 17px; font-weight: 700; color: #38bdf8;"
-        )
+        self.lbl_cut_duration.setObjectName("DurationLabel")
         self.lbl_cut_duration.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.btn_reset_range = QPushButton("Selecionar Tudo")
         self.btn_reset_range.clicked.connect(self._reset_range)
@@ -443,6 +541,7 @@ class AudioTrimmerWindow(QMainWindow):
         out_row.addWidget(QLabel("Salvar em:"))
         self.edit_output = QLineEdit()
         self.edit_output.setPlaceholderText("Escolha o arquivo de saída...")
+        self.edit_output.textChanged.connect(self._on_output_text_changed)
         self.btn_browse_out = QPushButton("Alterar...")
         self.btn_browse_out.clicked.connect(self._on_browse_output)
         self.btn_export = QPushButton("Cortar e Salvar (Sem Perda)")
@@ -472,17 +571,441 @@ class AudioTrimmerWindow(QMainWindow):
         export_layout.addLayout(status_row)
         main_layout.addWidget(export_card)
 
+    # --- UI 2: Clássica (VLC / MPC) ---
+    def _make_classic_divider(self) -> QFrame:
+        div = QFrame()
+        div.setObjectName("ClassicDivider")
+        div.setFrameShape(QFrame.Shape.VLine)
+        div.setFixedHeight(20)
+        return div
+
+    def _build_classic_ui(self, wave_palette) -> None:
+        root = QWidget(self)
+        self.setCentralWidget(root)
+        main_layout = QVBoxLayout(root)
+        main_layout.setContentsMargins(6, 6, 6, 4)
+        main_layout.setSpacing(6)
+
+        # --- Faixa superior compacta (estilo barra de mídia clássica) ---
+        top_bar = QFrame()
+        top_bar.setObjectName("ClassicHeaderBar")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(6, 4, 8, 4)
+        top_layout.setSpacing(8)
+
+        self.btn_open = QPushButton("Abrir...")
+        self.btn_open.setIcon(make_classic_icon("open"))
+        self.btn_open.setIconSize(QSize(14, 14))
+        self.btn_open.setToolTip("Abrir arquivo de áudio (Ctrl+O)")
+        self.btn_open.clicked.connect(self._on_open_clicked)
+
+        self.lbl_title = QLabel("Nenhum arquivo carregado")
+        self.lbl_title.setObjectName("TitleLabel")
+
+        top_layout.addWidget(self.btn_open)
+        top_layout.addWidget(self._make_classic_divider())
+        top_layout.addWidget(self.lbl_title, 1)
+        main_layout.addWidget(top_bar)
+
+        # --- Viewport rebaixado (tela escura estilo MPC / VLC) ---
+        viewport_frame = QFrame()
+        viewport_frame.setObjectName("ClassicViewport")
+        viewport_layout = QVBoxLayout(viewport_frame)
+        viewport_layout.setContentsMargins(1, 1, 1, 1)
+        viewport_layout.setSpacing(0)
+
+        self.waveform = WaveformWidget(palette=wave_palette)
+        self.waveform.rangeChanged.connect(self._on_waveform_range_changed)
+        self.waveform.seekRequested.connect(self._on_waveform_seek)
+        self.waveform.zoomChanged.connect(self._on_zoom_changed)
+        viewport_layout.addWidget(self.waveform, 1)
+        main_layout.addWidget(viewport_frame, 1)
+
+        # --- Barra de transporte clássica (logo abaixo do viewport, estilo MPC/VLC) ---
+        transport_bar = QFrame()
+        transport_bar.setObjectName("ClassicTransportBar")
+        transport = QHBoxLayout(transport_bar)
+        transport.setContentsMargins(6, 4, 6, 4)
+        transport.setSpacing(4)
+
+        icon_sz = QSize(14, 14)
+
+        self.btn_play = QPushButton()
+        self.btn_play.setObjectName("ClassicToolButton")
+        self.btn_play.setIcon(make_classic_icon("play"))
+        self.btn_play.setIconSize(icon_sz)
+        self.btn_play.setToolTip("Tocar / Pausar (Espaço)")
+        self.btn_play.clicked.connect(self._toggle_play)
+
+        self.btn_stop = QPushButton()
+        self.btn_stop.setObjectName("ClassicToolButton")
+        self.btn_stop.setIcon(make_classic_icon("stop"))
+        self.btn_stop.setIconSize(icon_sz)
+        self.btn_stop.setToolTip("Parar")
+        self.btn_stop.clicked.connect(self._stop_playback)
+
+        self.btn_play_sel = QPushButton()
+        self.btn_play_sel.setObjectName("ClassicToolButton")
+        self.btn_play_sel.setIcon(make_classic_icon("play_sel"))
+        self.btn_play_sel.setIconSize(icon_sz)
+        self.btn_play_sel.setToolTip("Tocar apenas a seleção (IN → OUT)")
+        self.btn_play_sel.clicked.connect(self._play_selection)
+
+        self.btn_jump_in = QPushButton()
+        self.btn_jump_in.setObjectName("ClassicToolButton")
+        self.btn_jump_in.setIcon(make_classic_icon("jump_in"))
+        self.btn_jump_in.setIconSize(icon_sz)
+        self.btn_jump_in.setToolTip("Ir para IN ([)")
+        self.btn_jump_in.clicked.connect(lambda: self._seek_to(self._start_sec))
+
+        self.btn_jump_out = QPushButton()
+        self.btn_jump_out.setObjectName("ClassicToolButton")
+        self.btn_jump_out.setIcon(make_classic_icon("jump_out"))
+        self.btn_jump_out.setIconSize(icon_sz)
+        self.btn_jump_out.setToolTip("Ir para OUT (])")
+        self.btn_jump_out.clicked.connect(lambda: self._seek_to(self._end_sec))
+
+        self.chk_loop = QCheckBox("Loop")
+        self.chk_loop.setToolTip("Repetir trecho selecionado continuamente")
+        self.chk_loop.toggled.connect(self._set_loop_enabled)
+
+        self.lbl_playhead = QLabel("00:00.000")
+        self.lbl_playhead.setObjectName("ClassicLcd")
+        self.lbl_playhead.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_playhead.setMinimumWidth(84)
+
+        transport.addWidget(self.btn_play)
+        transport.addWidget(self.btn_stop)
+        transport.addWidget(self.btn_play_sel)
+        transport.addWidget(self.btn_jump_in)
+        transport.addWidget(self.btn_jump_out)
+        transport.addSpacing(4)
+        transport.addWidget(self._make_classic_divider())
+        transport.addSpacing(4)
+        transport.addWidget(self.chk_loop)
+        transport.addSpacing(4)
+        transport.addWidget(self._make_classic_divider())
+        transport.addSpacing(4)
+        transport.addWidget(self.lbl_playhead)
+        transport.addStretch(1)
+
+        # Zoom clássico
+        self.btn_zoom_out = QPushButton("-")
+        self.btn_zoom_out.setObjectName("ClassicToolButton")
+        self.btn_zoom_out.setToolTip("Diminuir zoom")
+        self.btn_zoom_out.clicked.connect(self._zoom_out)
+
+        self.lbl_zoom = QLabel("1.0x")
+        self.lbl_zoom.setObjectName("ZoomLabel")
+        self.lbl_zoom.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.btn_zoom_in = QPushButton("+")
+        self.btn_zoom_in.setObjectName("ClassicToolButton")
+        self.btn_zoom_in.setToolTip("Aumentar zoom")
+        self.btn_zoom_in.clicked.connect(self._zoom_in)
+
+        self.btn_zoom_reset = QPushButton("1:1")
+        self.btn_zoom_reset.setObjectName("ClassicToolButton")
+        self.btn_zoom_reset.setToolTip("Resetar zoom (1.0x)")
+        self.btn_zoom_reset.clicked.connect(self._zoom_reset)
+
+        lbl_zoom_title = QLabel("Zoom:")
+        lbl_zoom_title.setStyleSheet("background: transparent;")
+        transport.addWidget(lbl_zoom_title)
+        transport.addWidget(self.btn_zoom_out)
+        transport.addWidget(self.lbl_zoom)
+        transport.addWidget(self.btn_zoom_in)
+        transport.addWidget(self.btn_zoom_reset)
+        transport.addSpacing(4)
+        transport.addWidget(self._make_classic_divider())
+        transport.addSpacing(4)
+
+        # Volume clássico com ícone de alto-falante + percentual
+        lbl_vol_icon = QLabel()
+        lbl_vol_icon.setPixmap(make_classic_icon("volume").pixmap(15, 15))
+        lbl_vol_icon.setStyleSheet("background: transparent;")
+        lbl_vol_icon.setToolTip("Volume")
+
+        self.slider_vol = QSlider(Qt.Orientation.Horizontal)
+        self.slider_vol.setRange(0, 100)
+        self.slider_vol.setValue(self._volume_pct)
+        self.slider_vol.setFixedWidth(92)
+        self.slider_vol.valueChanged.connect(self._on_volume_changed)
+
+        self.lbl_vol_pct = QLabel(f"{self._volume_pct}%")
+        self.lbl_vol_pct.setStyleSheet(
+            "background: transparent; font-family: Consolas; font-size: 11px; min-width: 32px;"
+        )
+        self.lbl_vol_pct.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        transport.addWidget(lbl_vol_icon)
+        transport.addWidget(self.slider_vol)
+        transport.addWidget(self.lbl_vol_pct)
+        main_layout.addWidget(transport_bar)
+
+        # --- Grupo clássico: Pontos de Corte (IN / OUT) ---
+        cut_group = QGroupBox("Pontos de Corte (IN / OUT)")
+        cut_outer = QHBoxLayout(cut_group)
+        cut_outer.setContentsMargins(8, 8, 8, 6)
+        cut_outer.setSpacing(10)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(5)
+        grid.setVerticalSpacing(5)
+
+        # Linha IN
+        tag_in = QLabel("IN")
+        tag_in.setObjectName("ClassicInTag")
+        tag_in.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tag_in.setFixedWidth(34)
+
+        self.edit_start = QLineEdit("00:00.000")
+        self.edit_start.setMinimumWidth(110)
+        self.edit_start.editingFinished.connect(self._on_start_edited)
+
+        self.btn_mark_in = QPushButton("Marcar (I)")
+        self.btn_mark_in.clicked.connect(self._mark_in_at_playhead)
+
+        self.btn_in_m1 = QPushButton("-1s")
+        self.btn_in_m1.setObjectName("NudgeButton")
+        self.btn_in_m1.clicked.connect(lambda: self._nudge_start(-1.0))
+        self.btn_in_m01 = QPushButton("-0.1s")
+        self.btn_in_m01.setObjectName("NudgeButton")
+        self.btn_in_m01.clicked.connect(lambda: self._nudge_start(-0.1))
+        self.btn_in_p01 = QPushButton("+0.1s")
+        self.btn_in_p01.setObjectName("NudgeButton")
+        self.btn_in_p01.clicked.connect(lambda: self._nudge_start(0.1))
+        self.btn_in_p1 = QPushButton("+1s")
+        self.btn_in_p1.setObjectName("NudgeButton")
+        self.btn_in_p1.clicked.connect(lambda: self._nudge_start(1.0))
+
+        grid.addWidget(tag_in, 0, 0)
+        grid.addWidget(QLabel("Início:"), 0, 1)
+        grid.addWidget(self.edit_start, 0, 2)
+        grid.addWidget(self.btn_mark_in, 0, 3)
+        grid.addWidget(self.btn_in_m1, 0, 4)
+        grid.addWidget(self.btn_in_m01, 0, 5)
+        grid.addWidget(self.btn_in_p01, 0, 6)
+        grid.addWidget(self.btn_in_p1, 0, 7)
+
+        # Linha OUT
+        tag_out = QLabel("OUT")
+        tag_out.setObjectName("ClassicOutTag")
+        tag_out.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tag_out.setFixedWidth(34)
+
+        self.edit_end = QLineEdit("00:00.000")
+        self.edit_end.setMinimumWidth(110)
+        self.edit_end.editingFinished.connect(self._on_end_edited)
+
+        self.btn_mark_out = QPushButton("Marcar (O)")
+        self.btn_mark_out.clicked.connect(self._mark_out_at_playhead)
+
+        self.btn_out_m1 = QPushButton("-1s")
+        self.btn_out_m1.setObjectName("NudgeButton")
+        self.btn_out_m1.clicked.connect(lambda: self._nudge_end(-1.0))
+        self.btn_out_m01 = QPushButton("-0.1s")
+        self.btn_out_m01.setObjectName("NudgeButton")
+        self.btn_out_m01.clicked.connect(lambda: self._nudge_end(-0.1))
+        self.btn_out_p01 = QPushButton("+0.1s")
+        self.btn_out_p01.setObjectName("NudgeButton")
+        self.btn_out_p01.clicked.connect(lambda: self._nudge_end(0.1))
+        self.btn_out_p1 = QPushButton("+1s")
+        self.btn_out_p1.setObjectName("NudgeButton")
+        self.btn_out_p1.clicked.connect(lambda: self._nudge_end(1.0))
+
+        grid.addWidget(tag_out, 1, 0)
+        grid.addWidget(QLabel("Fim:"), 1, 1)
+        grid.addWidget(self.edit_end, 1, 2)
+        grid.addWidget(self.btn_mark_out, 1, 3)
+        grid.addWidget(self.btn_out_m1, 1, 4)
+        grid.addWidget(self.btn_out_m01, 1, 5)
+        grid.addWidget(self.btn_out_p01, 1, 6)
+        grid.addWidget(self.btn_out_p1, 1, 7)
+        grid.setColumnStretch(2, 1)
+
+        # Coluna direita: Duração + Selecionar Tudo
+        cut_div = QFrame()
+        cut_div.setObjectName("ClassicDivider")
+        cut_div.setFrameShape(QFrame.Shape.VLine)
+
+        dur_col = QVBoxLayout()
+        dur_col.setSpacing(4)
+        dur_col.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_dur_title = QLabel("Duração do corte")
+        lbl_dur_title.setObjectName("MetaLabel")
+        lbl_dur_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_cut_duration = QLabel("00:00.000")
+        self.lbl_cut_duration.setObjectName("ClassicDurationBox")
+        self.lbl_cut_duration.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.btn_reset_range = QPushButton("Selecionar Tudo")
+        self.btn_reset_range.clicked.connect(self._reset_range)
+        dur_col.addWidget(lbl_dur_title)
+        dur_col.addWidget(self.lbl_cut_duration)
+        dur_col.addWidget(self.btn_reset_range)
+
+        cut_outer.addLayout(grid, 1)
+        cut_outer.addWidget(cut_div)
+        cut_outer.addLayout(dur_col)
+        main_layout.addWidget(cut_group)
+
+        # --- Grupo clássico: Exportação ---
+        export_group = QGroupBox("Exportação (Sem Perda)")
+        export_row = QHBoxLayout(export_group)
+        export_row.setContentsMargins(8, 8, 8, 6)
+        export_row.setSpacing(6)
+
+        export_row.addWidget(QLabel("Salvar em:"))
+        self.edit_output = QLineEdit()
+        self.edit_output.setPlaceholderText("Escolha o arquivo de saída...")
+        self.edit_output.textChanged.connect(self._on_output_text_changed)
+        self.btn_browse_out = QPushButton("Procurar...")
+        self.btn_browse_out.clicked.connect(self._on_browse_output)
+        self.btn_export = QPushButton("Cortar e Salvar")
+        self.btn_export.setObjectName("PrimaryButton")
+        self.btn_export.setIcon(make_classic_icon("save"))
+        self.btn_export.setIconSize(QSize(14, 14))
+        self.btn_export.clicked.connect(self._on_export_clicked)
+
+        export_row.addWidget(self.edit_output, 1)
+        export_row.addWidget(self.btn_browse_out)
+        export_row.addWidget(self.btn_export)
+        main_layout.addWidget(export_group)
+
+        # --- Barra de Status Clássica (estilo MPC-HC / VLC) ---
+        sb = self.statusBar()
+        sb.setVisible(True)
+        sb.setSizeGripEnabled(True)
+
+        self.lbl_status = QLabel("Pronto.")
+        self.lbl_status.setObjectName("StatusCell")
+        self.btn_open_folder = QPushButton("Abrir Pasta")
+        self.btn_open_folder.setObjectName("NudgeButton")
+        self.btn_open_folder.setVisible(False)
+        self.btn_open_folder.clicked.connect(self._open_output_folder)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setVisible(False)
+        self.progress.setFixedWidth(130)
+
+        self.lbl_meta = QLabel("Sem arquivo")
+        self.lbl_meta.setObjectName("StatusCell")
+        self.lbl_badge = QLabel("Stream Copy • Sem Perda")
+        self.lbl_badge.setObjectName("BadgeLossless")
+        self.lbl_status_time = QLabel("00:00.000 / 00:00.000")
+        self.lbl_status_time.setObjectName("StatusTimeCell")
+
+        sb.addWidget(self.lbl_status, 1)
+        sb.addWidget(self.btn_open_folder)
+        sb.addWidget(self.progress)
+        sb.addPermanentWidget(self.lbl_meta)
+        sb.addPermanentWidget(self.lbl_badge)
+        sb.addPermanentWidget(self.lbl_status_time)
+
+        self._statusbar_widgets = [
+            self.lbl_status,
+            self.btn_open_folder,
+            self.progress,
+            self.lbl_meta,
+            self.lbl_badge,
+            self.lbl_status_time,
+        ]
+
+    def _restore_ui_state(self, zoom: float = 1.0, view_start: float = 0.0) -> None:
+        self.chk_loop.blockSignals(True)
+        self.chk_loop.setChecked(self._loop_enabled)
+        self.chk_loop.blockSignals(False)
+
+        self.slider_vol.blockSignals(True)
+        self.slider_vol.setValue(self._volume_pct)
+        self.slider_vol.blockSignals(False)
+        if self.lbl_vol_pct is not None:
+            self.lbl_vol_pct.setText(f"{self._volume_pct}%")
+
+        self.edit_output.blockSignals(True)
+        self.edit_output.setText(self._output_text)
+        self.edit_output.blockSignals(False)
+
+        self.lbl_status.setText(self._status_text)
+        self.progress.setVisible(self._is_busy)
+        self.btn_open_folder.setVisible(self._open_folder_visible and not self._is_busy)
+
+        if self._audio_info is not None:
+            info = self._audio_info
+            self.lbl_title.setText(info.display_title)
+            if self._current_theme_id == THEME_CLASSIC:
+                self.lbl_meta.setText(info.summary_text)
+            else:
+                self.lbl_meta.setText(
+                    f"{info.summary_text}  •  Duração: {format_time(info.duration)}"
+                )
+            if info.codec_name.lower() == "flac" or info.path.suffix.lower() == ".flac":
+                self.lbl_badge.setText("FLAC Lossless • Bit-Exact")
+            else:
+                self.lbl_badge.setText("Stream Copy • Sem Perda")
+
+            if self._peaks is not None:
+                self.waveform.set_audio(self._peaks, info.duration)
+                self.waveform.set_range(self._start_sec, self._end_sec)
+                self.waveform.set_playhead(self._playhead_sec)
+                if zoom > 1.0 or view_start > 0.0:
+                    self.waveform.restore_view_state(zoom, view_start)
+            self._sync_time_fields()
+        else:
+            self.lbl_title.setText("Nenhum arquivo carregado")
+            if self._current_theme_id == THEME_CLASSIC:
+                self.lbl_meta.setText("Sem arquivo")
+            else:
+                self.lbl_meta.setText(
+                    "Arraste MP3, M4A, WAV, FLAC, OGG, OPUS ou clique em Abrir Áudio"
+                )
+            self.lbl_badge.setText("Stream Copy • Sem Perda")
+            self._sync_time_fields()
+
+        self._update_playhead_labels(self._playhead_sec)
+        self._update_play_button_visual(
+            self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        )
+        self.btn_open.setEnabled(not self._is_busy)
+        self.act_open.setEnabled(not self._is_busy)
+        self._update_controls_enabled(self._audio_info is not None and not self._is_busy)
+
+    # --- Atalhos ---
+    def _shortcut_guard(self, callback) -> None:
+        if isinstance(self.focusWidget(), QLineEdit):
+            return
+        callback()
+
     def _setup_shortcuts(self) -> None:
-        QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self._toggle_play)
-        QShortcut(QKeySequence("I"), self, activated=self._mark_in_at_playhead)
-        QShortcut(QKeySequence("O"), self, activated=self._mark_out_at_playhead)
-        QShortcut(QKeySequence("["), self, activated=lambda: self._seek_to(self._start_sec))
-        QShortcut(QKeySequence("]"), self, activated=lambda: self._seek_to(self._end_sec))
-        QShortcut(QKeySequence("Ctrl+O"), self, activated=self._on_open_clicked)
-        QShortcut(QKeySequence("Ctrl+S"), self, activated=self._on_export_clicked)
+        QShortcut(
+            QKeySequence(Qt.Key.Key_Space),
+            self,
+            activated=lambda: self._shortcut_guard(self._toggle_play),
+        )
+        QShortcut(
+            QKeySequence("I"),
+            self,
+            activated=lambda: self._shortcut_guard(self._mark_in_at_playhead),
+        )
+        QShortcut(
+            QKeySequence("O"),
+            self,
+            activated=lambda: self._shortcut_guard(self._mark_out_at_playhead),
+        )
+        QShortcut(
+            QKeySequence("["),
+            self,
+            activated=lambda: self._shortcut_guard(lambda: self._seek_to(self._start_sec)),
+        )
+        QShortcut(
+            QKeySequence("]"),
+            self,
+            activated=lambda: self._shortcut_guard(lambda: self._seek_to(self._end_sec)),
+        )
 
     def _update_controls_enabled(self, enabled: bool) -> None:
-        for widget in (
+        widgets = [
             self.btn_play,
             self.btn_play_sel,
             self.btn_stop,
@@ -506,8 +1029,83 @@ class AudioTrimmerWindow(QMainWindow):
             self.edit_output,
             self.btn_browse_out,
             self.btn_export,
-        ):
+        ]
+        if self.btn_jump_in is not None:
+            widgets.append(self.btn_jump_in)
+        if self.btn_jump_out is not None:
+            widgets.append(self.btn_jump_out)
+        for widget in widgets:
             widget.setEnabled(enabled)
+
+        for act in (
+            self.act_export,
+            self.act_play,
+            self.act_play_sel,
+            self.act_stop,
+            self.act_loop,
+            self.act_jump_in,
+            self.act_jump_out,
+            self.act_mark_in,
+            self.act_mark_out,
+            self.act_reset_range,
+            self.act_zoom_in,
+            self.act_zoom_out,
+            self.act_zoom_reset,
+        ):
+            act.setEnabled(enabled)
+
+        self.act_open_folder.setEnabled(bool(self._last_output_path) and not self._is_busy)
+
+    # --- Helpers de estado sincronizado ---
+    def _set_status(self, text: str) -> None:
+        self._status_text = text
+        self.lbl_status.setText(text)
+
+    def _set_loop_enabled(self, checked: bool) -> None:
+        self._loop_enabled = bool(checked)
+        if hasattr(self, "chk_loop") and self.chk_loop.isChecked() != self._loop_enabled:
+            self.chk_loop.blockSignals(True)
+            self.chk_loop.setChecked(self._loop_enabled)
+            self.chk_loop.blockSignals(False)
+        if self.act_loop.isChecked() != self._loop_enabled:
+            self.act_loop.blockSignals(True)
+            self.act_loop.setChecked(self._loop_enabled)
+            self.act_loop.blockSignals(False)
+
+    def _on_volume_changed(self, value: int) -> None:
+        self._volume_pct = int(value)
+        self._audio_output.setVolume(self._volume_pct / 100.0)
+        if self.lbl_vol_pct is not None:
+            self.lbl_vol_pct.setText(f"{self._volume_pct}%")
+
+    def _on_output_text_changed(self, text: str) -> None:
+        self._output_text = text
+
+    def _zoom_in(self) -> None:
+        self.waveform.set_zoom(self.waveform.zoom_factor() * 1.4)
+
+    def _zoom_out(self) -> None:
+        self.waveform.set_zoom(self.waveform.zoom_factor() * 0.7)
+
+    def _zoom_reset(self) -> None:
+        self.waveform.reset_zoom()
+
+    def _update_playhead_labels(self, sec: float) -> None:
+        self._playhead_sec = max(0.0, float(sec))
+        cur_str = format_time(self._playhead_sec)
+        self.lbl_playhead.setText(cur_str)
+        if self.lbl_status_time is not None:
+            total = self._audio_info.duration if self._audio_info else 0.0
+            self.lbl_status_time.setText(f"{cur_str} / {format_time(total)}")
+
+    def _update_play_button_visual(self, playing: bool) -> None:
+        if self._current_theme_id == THEME_CLASSIC:
+            self.btn_play.setText("")
+            self.btn_play.setIcon(make_classic_icon("pause" if playing else "play"))
+            self.btn_play.setToolTip("Pausar (Espaço)" if playing else "Tocar (Espaço)")
+        else:
+            self.btn_play.setIcon(QIcon())
+            self.btn_play.setText("Pausar (Espaço)" if playing else "Tocar (Espaço)")
 
     # --- Drag & Drop ---
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
@@ -545,12 +1143,16 @@ class AudioTrimmerWindow(QMainWindow):
 
         self._stop_playback()
         self._player.setSource(QUrl())
+        self._peaks = None
         self.waveform.clear_audio()
+        self._is_busy = True
+        self._open_folder_visible = False
         self._update_controls_enabled(False)
         self.btn_open.setEnabled(False)
+        self.act_open.setEnabled(False)
         self.btn_open_folder.setVisible(False)
         self.progress.setVisible(True)
-        self.lbl_status.setText(f"Analisando '{path.name}'...")
+        self._set_status(f"Analisando '{path.name}'...")
 
         self._load_worker = LoadAudioWorker(path)
         self._load_worker.loaded.connect(self._on_audio_loaded)
@@ -559,11 +1161,18 @@ class AudioTrimmerWindow(QMainWindow):
 
     def _on_audio_loaded(self, info: AudioInfo, peaks) -> None:
         self._audio_info = info
+        self._peaks = peaks
         self._start_sec = 0.0
         self._end_sec = info.duration
+        self._playhead_sec = 0.0
+        self._is_busy = False
 
         self.lbl_title.setText(info.display_title)
-        self.lbl_meta.setText(f"{info.summary_text}  •  Duração: {format_time(info.duration)}")
+        if self._current_theme_id == THEME_CLASSIC:
+            self.lbl_meta.setText(info.summary_text)
+        else:
+            self.lbl_meta.setText(f"{info.summary_text}  •  Duração: {format_time(info.duration)}")
+
         if info.codec_name.lower() == "flac" or info.path.suffix.lower() == ".flac":
             self.lbl_badge.setText("FLAC Lossless • Bit-Exact")
         else:
@@ -571,23 +1180,29 @@ class AudioTrimmerWindow(QMainWindow):
 
         self.waveform.set_audio(peaks, info.duration)
         self._sync_time_fields()
+        self._update_playhead_labels(0.0)
 
         suggested = info.path.with_name(f"{info.path.stem}_trim{info.path.suffix}")
-        self.edit_output.setText(str(suggested))
+        self._output_text = str(suggested)
+        self.edit_output.setText(self._output_text)
 
         self._player.setSource(QUrl.fromLocalFile(str(info.path)))
 
         self.progress.setVisible(False)
         self.btn_open.setEnabled(True)
+        self.act_open.setEnabled(True)
         self._update_controls_enabled(True)
-        self.lbl_status.setText(
+        self._set_status(
             "Dica: arraste as alças IN/OUT, use a roda do mouse para zoom e Espaço para tocar."
         )
 
     def _on_audio_load_failed(self, err: str) -> None:
+        self._is_busy = False
         self.progress.setVisible(False)
         self.btn_open.setEnabled(True)
-        self.lbl_status.setText("Erro ao carregar arquivo.")
+        self.act_open.setEnabled(True)
+        self._update_controls_enabled(self._audio_info is not None)
+        self._set_status("Erro ao carregar arquivo.")
         QMessageBox.critical(self, "Erro ao abrir áudio", err)
 
     # --- Sincronização de tempos ---
@@ -704,7 +1319,7 @@ class AudioTrimmerWindow(QMainWindow):
         self._player.stop()
         if self._audio_info:
             self.waveform.set_playhead(0.0)
-            self.lbl_playhead.setText("00:00.000")
+            self._update_playhead_labels(0.0)
 
     def _seek_to(self, sec: float) -> None:
         if not self._audio_info:
@@ -712,19 +1327,19 @@ class AudioTrimmerWindow(QMainWindow):
         sec = max(0.0, min(sec, self._audio_info.duration))
         self._player.setPosition(int(sec * 1000))
         self.waveform.set_playhead(sec)
-        self.lbl_playhead.setText(format_time(sec))
+        self._update_playhead_labels(sec)
 
     def _on_waveform_seek(self, sec: float) -> None:
         self._player.setPosition(int(sec * 1000))
-        self.lbl_playhead.setText(format_time(sec))
+        self._update_playhead_labels(sec)
 
     def _on_player_position_changed(self, pos_ms: int) -> None:
         sec = pos_ms / 1000.0
         self.waveform.set_playhead(sec)
-        self.lbl_playhead.setText(format_time(sec))
+        self._update_playhead_labels(sec)
 
         if self._play_selection_only and sec >= self._end_sec:
-            if self.chk_loop.isChecked():
+            if self._loop_enabled:
                 self._player.setPosition(int(self._start_sec * 1000))
             else:
                 self._player.pause()
@@ -732,10 +1347,7 @@ class AudioTrimmerWindow(QMainWindow):
                 self._play_selection_only = False
 
     def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.btn_play.setText("Pausar (Espaço)")
-        else:
-            self.btn_play.setText("Tocar (Espaço)")
+        self._update_play_button_visual(state == QMediaPlayer.PlaybackState.PlayingState)
 
     # --- Exportação ---
     def _on_browse_output(self) -> None:
@@ -755,7 +1367,8 @@ class AudioTrimmerWindow(QMainWindow):
             chosen_path = Path(chosen)
             if not chosen_path.suffix:
                 chosen_path = chosen_path.with_suffix(ext)
-            self.edit_output.setText(str(chosen_path))
+            self._output_text = str(chosen_path)
+            self.edit_output.setText(self._output_text)
 
     def _on_export_clicked(self) -> None:
         if not self._audio_info:
@@ -771,7 +1384,8 @@ class AudioTrimmerWindow(QMainWindow):
         output_path = Path(out_text)
         if not output_path.suffix:
             output_path = output_path.with_suffix(self._audio_info.path.suffix)
-            self.edit_output.setText(str(output_path))
+            self._output_text = str(output_path)
+            self.edit_output.setText(self._output_text)
 
         # Avisa se formato de saída for diferente do original (pois stream copy exige mesmo container/codec)
         if output_path.suffix.lower() != self._audio_info.path.suffix.lower():
@@ -789,7 +1403,8 @@ class AudioTrimmerWindow(QMainWindow):
                 return
             if resp == QMessageBox.StandardButton.Yes:
                 output_path = output_path.with_suffix(self._audio_info.path.suffix)
-                self.edit_output.setText(str(output_path))
+                self._output_text = str(output_path)
+                self.edit_output.setText(self._output_text)
 
         overwriting_source = output_path.resolve() == self._audio_info.path.resolve()
         if output_path.exists():
@@ -811,11 +1426,14 @@ class AudioTrimmerWindow(QMainWindow):
             self._player.stop()
             self._player.setSource(QUrl())
 
+        self._is_busy = True
+        self._open_folder_visible = False
         self._update_controls_enabled(False)
         self.btn_open.setEnabled(False)
+        self.act_open.setEnabled(False)
         self.btn_open_folder.setVisible(False)
         self.progress.setVisible(True)
-        self.lbl_status.setText("Cortando áudio sem re-encode...")
+        self._set_status("Cortando áudio sem re-encode...")
 
         self._trim_worker = TrimWorker(
             self._audio_info.path,
@@ -831,12 +1449,15 @@ class AudioTrimmerWindow(QMainWindow):
         self._trim_worker.start()
 
     def _on_trim_finished(self, res: TrimResult, reload_source: bool) -> None:
+        self._is_busy = False
         self.progress.setVisible(False)
         self.btn_open.setEnabled(True)
-        self._update_controls_enabled(True)
+        self.act_open.setEnabled(True)
         self._last_output_path = res.output_path
+        self._open_folder_visible = True
+        self._update_controls_enabled(True)
         self.btn_open_folder.setVisible(True)
-        self.lbl_status.setText(
+        self._set_status(
             f"Concluído ({res.mode_description}): '{res.output_path.name}' • {format_time(res.output_duration)}"
         )
 
@@ -844,10 +1465,12 @@ class AudioTrimmerWindow(QMainWindow):
             self.load_file(res.output_path)
 
     def _on_trim_failed(self, err: str) -> None:
+        self._is_busy = False
         self.progress.setVisible(False)
         self.btn_open.setEnabled(True)
+        self.act_open.setEnabled(True)
         self._update_controls_enabled(True)
-        self.lbl_status.setText("Falha ao cortar o áudio.")
+        self._set_status("Falha ao cortar o áudio.")
         if self._audio_info and self._player.source().isEmpty():
             self._player.setSource(QUrl.fromLocalFile(str(self._audio_info.path)))
         QMessageBox.critical(self, "Erro ao cortar", err)

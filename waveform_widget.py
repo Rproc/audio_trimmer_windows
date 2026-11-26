@@ -15,6 +15,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QWidget
 
 from audio_engine import format_time
+from themes import MODERN_WAVEFORM_PALETTE, WaveformPalette
 
 
 class WaveformWidget(QWidget):
@@ -28,12 +29,17 @@ class WaveformWidget(QWidget):
     HANDLE_HIT_PX = 10
     MIN_SELECTION_SEC = 0.05
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        palette: WaveformPalette | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setMinimumHeight(190)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
+        self._palette: WaveformPalette = palette or MODERN_WAVEFORM_PALETTE
         self._peaks: np.ndarray | None = None
         self._duration: float = 0.0
         self._start_sec: float = 0.0
@@ -47,6 +53,22 @@ class WaveformWidget(QWidget):
         self._pan_anchor_x: float = 0.0
         self._pan_anchor_view_start: float = 0.0
         self._hover_target: str | None = None
+
+    def set_palette(self, palette: WaveformPalette) -> None:
+        self._palette = palette
+        self.update()
+
+    def view_state(self) -> tuple[float, float]:
+        return self._zoom, self._view_start
+
+    def restore_view_state(self, zoom: float, view_start: float) -> None:
+        if self._duration <= 0:
+            return
+        self._zoom = max(1.0, min(float(zoom), 60.0))
+        span = self._visible_span()
+        self._view_start = max(0.0, min(float(view_start), max(0.0, self._duration - span)))
+        self.zoomChanged.emit(self._zoom)
+        self.update()
 
     def set_audio(self, peaks: np.ndarray, duration: float) -> None:
         self._peaks = peaks
@@ -252,6 +274,7 @@ class WaveformWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
+        pal = self._palette
         w = self.width()
         h = self.height()
         wave_top = self.RULER_HEIGHT
@@ -259,19 +282,30 @@ class WaveformWidget(QWidget):
         mid_y = wave_top + wave_h / 2.0
 
         # Fundo geral
-        painter.fillRect(0, 0, w, h, QColor("#0f172a"))
-        painter.fillRect(0, 0, w, self.RULER_HEIGHT, QColor("#111827"))
+        painter.fillRect(0, 0, w, h, QColor(pal.bg))
+        painter.fillRect(0, 0, w, self.RULER_HEIGHT, QColor(pal.ruler_bg))
 
         if self._peaks is None or self._duration <= 0:
-            painter.setPen(QColor("#64748b"))
-            font = QFont("Segoe UI", 11)
+            if pal.classic_style:
+                self._draw_classic_grid(painter, w, wave_top, wave_h, mid_y)
+            painter.setPen(QColor(pal.empty_text))
+            font = QFont("Segoe UI", 10 if pal.classic_style else 11)
             painter.setFont(font)
             painter.drawText(
-                QRectF(0, 0, w, h),
+                QRectF(0, wave_top, w, wave_h),
                 Qt.AlignmentFlag.AlignCenter,
                 "Arraste um arquivo de áudio aqui ou clique em 'Abrir Áudio'",
             )
+            painter.setPen(QPen(QColor(pal.ruler_border), 1))
+            painter.drawLine(0, self.RULER_HEIGHT, w, self.RULER_HEIGHT)
+            painter.setPen(QPen(QColor(pal.border), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(0, 0, w - 1, h - 1)
             return
+
+        # Grade sutil de osciloscópio no tema clássico
+        if pal.classic_style:
+            self._draw_classic_grid(painter, w, wave_top, wave_h, mid_y)
 
         # Régua de tempo
         self._draw_ruler(painter, w)
@@ -284,11 +318,11 @@ class WaveformWidget(QWidget):
         if sel_right > sel_left:
             painter.fillRect(
                 QRectF(sel_left, wave_top, sel_right - sel_left, wave_h),
-                QColor(56, 189, 248, 28),
+                QColor(*pal.selection_fill),
             )
 
         # Linha central
-        painter.setPen(QPen(QColor("#1e293b"), 1))
+        painter.setPen(QPen(QColor(pal.center_line), 1))
         painter.drawLine(0, int(mid_y), w, int(mid_y))
 
         # Forma de onda
@@ -298,13 +332,13 @@ class WaveformWidget(QWidget):
         if sx > 0:
             painter.fillRect(
                 QRectF(0, wave_top, min(float(w), sx), wave_h),
-                QColor(2, 6, 23, 130),
+                QColor(*pal.dim_overlay),
             )
         if ex < w:
             left_dim = max(0.0, ex)
             painter.fillRect(
                 QRectF(left_dim, wave_top, w - left_dim, wave_h),
-                QColor(2, 6, 23, 130),
+                QColor(*pal.dim_overlay),
             )
 
         # Marcadores In / Out
@@ -313,7 +347,7 @@ class WaveformWidget(QWidget):
             sx,
             wave_top,
             h,
-            QColor("#22c55e"),
+            QColor(pal.handle_in),
             "IN",
             align_right=False,
             active=(self._drag_mode == "start"),
@@ -324,7 +358,7 @@ class WaveformWidget(QWidget):
             ex,
             wave_top,
             h,
-            QColor("#f59e0b"),
+            QColor(pal.handle_out),
             "OUT",
             align_right=True,
             active=(self._drag_mode == "end"),
@@ -334,7 +368,7 @@ class WaveformWidget(QWidget):
         # Playhead
         px = self._time_to_x(self._playhead_sec)
         if -2 <= px <= w + 2:
-            painter.setPen(QPen(QColor("#f43f5e"), 1.8))
+            painter.setPen(QPen(QColor(pal.playhead), 1.8))
             painter.drawLine(QPointF(px, wave_top), QPointF(px, h))
             tri = QPolygonF(
                 [
@@ -343,16 +377,33 @@ class WaveformWidget(QWidget):
                     QPointF(px, wave_top + 8),
                 ]
             )
-            painter.setBrush(QColor("#f43f5e"))
+            painter.setBrush(QColor(pal.playhead))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawPolygon(tri)
 
         # Borda do widget
-        painter.setPen(QPen(QColor("#1e293b"), 1))
+        painter.setPen(QPen(QColor(pal.border), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(0, 0, w - 1, h - 1)
 
+    def _draw_classic_grid(
+        self,
+        painter: QPainter,
+        w: int,
+        wave_top: int,
+        wave_h: int,
+        mid_y: float,
+    ) -> None:
+        painter.setPen(QPen(QColor(self._palette.grid_line), 1, Qt.PenStyle.DotLine))
+        quarter = wave_h * 0.25
+        for y in (mid_y - quarter, mid_y + quarter):
+            painter.drawLine(0, int(y), w, int(y))
+        step_x = max(60, w // 12)
+        for gx in range(step_x, w, step_x):
+            painter.drawLine(gx, wave_top, gx, wave_top + wave_h)
+
     def _draw_ruler(self, painter: QPainter, w: int) -> None:
+        pal = self._palette
         span = self._visible_span()
         candidates = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
         target_ticks = max(4, w // 110)
@@ -368,14 +419,14 @@ class WaveformWidget(QWidget):
         while t <= self._view_start + span + step * 0.1:
             x = self._time_to_x(t)
             if 0 <= x <= w:
-                painter.setPen(QPen(QColor("#334155"), 1))
+                painter.setPen(QPen(QColor(pal.ruler_tick), 1))
                 painter.drawLine(QPointF(x, self.RULER_HEIGHT - 7), QPointF(x, self.RULER_HEIGHT))
-                painter.setPen(QColor("#94a3b8"))
+                painter.setPen(QColor(pal.ruler_text))
                 label = format_time(t, include_ms=(step < 1.0))
                 painter.drawText(QPointF(x + 4, self.RULER_HEIGHT - 8), label)
             t += step
 
-        painter.setPen(QPen(QColor("#1e293b"), 1))
+        painter.setPen(QPen(QColor(pal.ruler_border), 1))
         painter.drawLine(0, self.RULER_HEIGHT, w, self.RULER_HEIGHT)
 
     def _draw_waveform(
@@ -388,6 +439,7 @@ class WaveformWidget(QWidget):
         sx: float,
         ex: float,
     ) -> None:
+        pal = self._palette
         peaks = self._peaks
         assert peaks is not None
         n = len(peaks)
@@ -397,8 +449,8 @@ class WaveformWidget(QWidget):
         idx_start_f = (self._view_start / self._duration) * n
         idx_end_f = ((self._view_start + span) / self._duration) * n
 
-        pen_in = QPen(QColor("#38bdf8"), 1)
-        pen_out = QPen(QColor("#475569"), 1)
+        pen_in = QPen(QColor(pal.wave_in), 1)
+        pen_out = QPen(QColor(pal.wave_out), 1)
 
         for x in range(w):
             b0 = int(idx_start_f + (x / max(1, w)) * (idx_end_f - idx_start_f))
@@ -433,6 +485,7 @@ class WaveformWidget(QWidget):
     ) -> None:
         if x < -20 or x > self.width() + 20:
             return
+        pal = self._palette
         line_w = 2.5 if active else 2.0
         painter.setPen(QPen(color, line_w))
         painter.drawLine(QPointF(x, wave_top), QPointF(x, h))
@@ -443,15 +496,19 @@ class WaveformWidget(QWidget):
         tab_x = max(0.0, min(tab_x, self.width() - tab_w))
 
         painter.setBrush(color)
-        painter.setPen(Qt.PenStyle.NoPen)
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(tab_x, wave_top + 2, tab_w, tab_h), 4, 4)
-        painter.drawPath(path)
+        if pal.classic_style:
+            painter.setPen(QPen(QColor("#0b0d0f"), 1))
+            painter.drawRect(QRectF(tab_x, wave_top + 1, tab_w, tab_h))
+        else:
+            painter.setPen(Qt.PenStyle.NoPen)
+            path = QPainterPath()
+            path.addRoundedRect(QRectF(tab_x, wave_top + 2, tab_w, tab_h), 4, 4)
+            painter.drawPath(path)
 
-        painter.setPen(QColor("#0f172a"))
+        painter.setPen(QColor(pal.handle_text))
         painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         painter.drawText(
-            QRectF(tab_x, wave_top + 2, tab_w, tab_h),
+            QRectF(tab_x, wave_top + (1 if pal.classic_style else 2), tab_w, tab_h),
             Qt.AlignmentFlag.AlignCenter,
             label,
         )
@@ -462,10 +519,13 @@ class WaveformWidget(QWidget):
             pill_h = 20
             pill_x = max(4.0, min(x - pill_w / 2.0, self.width() - pill_w - 4.0))
             pill_y = h - pill_h - 6
-            painter.setBrush(QColor("#020617"))
+            painter.setBrush(QColor(pal.pill_bg))
             painter.setPen(QPen(color, 1))
-            painter.drawRoundedRect(QRectF(pill_x, pill_y, pill_w, pill_h), 4, 4)
-            painter.setPen(QColor("#f8fafc"))
+            if pal.classic_style:
+                painter.drawRect(QRectF(pill_x, pill_y, pill_w, pill_h))
+            else:
+                painter.drawRoundedRect(QRectF(pill_x, pill_y, pill_w, pill_h), 4, 4)
+            painter.setPen(QColor(pal.pill_text))
             painter.setFont(QFont("Consolas", 8))
             painter.drawText(
                 QRectF(pill_x, pill_y, pill_w, pill_h),

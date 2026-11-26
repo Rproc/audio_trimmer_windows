@@ -19,6 +19,9 @@ Aplicativo desktop em **Python + PySide6 (Qt 6)** para cortar (*trim*) arquivos 
   - Controle de volume e cursor arrastável na forma de onda.
 - **Drag & Drop:** arraste arquivos de áudio diretamente para a janela.
 - **Sobrescrita segura:** grava primeiro em arquivo temporário e só substitui o destino após sucesso do FFmpeg.
+- **Dois temas de interface (menu `Tema`):**
+  - **Moderno (Escuro):** visual atual em modo escuro com cards arredondados.
+  - **Clássico (VLC / MPC):** interface clássica de desktop com barra de transporte compacta com ícones, visor de tempo em estilo LCD, grupos clássicos (`QGroupBox`) e barra de status multipainel.
 
 ---
 
